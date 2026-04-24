@@ -1,7 +1,7 @@
 from google.cloud import texttospeech
 import os
 
-os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", "./google-creds.json")
+
 
 tts_client = texttospeech.TextToSpeechClient()
 

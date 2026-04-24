@@ -1,7 +1,7 @@
 from google.cloud import speech
 import os
 
-os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", "./google-creds.json")
+
 
 stt_client = speech.SpeechClient()
 

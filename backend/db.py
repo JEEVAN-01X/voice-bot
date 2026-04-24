@@ -1,57 +1,43 @@
-import sqlite3
 import json
-from datetime import datetime
 import os
+from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "orders.db")
+def _get_db():
+    if not firebase_admin._apps:
+        cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        if cred_json:
+            import tempfile
+            cred_dict = json.loads(cred_json)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump(cred_dict, f)
+                tmp_path = f.name
+            cred = credentials.Certificate(tmp_path)
+        else:
+            cred = credentials.Certificate("firebase-creds.json")
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id TEXT PRIMARY KEY,
-            customer_phone TEXT,
-            language TEXT,
-            items TEXT,
-            address TEXT,
-            status TEXT DEFAULT 'confirmed',
-            raw_transcript TEXT,
-            confirmed_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
+    pass  # Firestore creates collections automatically
 
 def save_order(order_id: str, order_data: dict):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        INSERT OR REPLACE INTO orders
-        (id, customer_phone, language, items, address, status, raw_transcript, confirmed_at)
-        VALUES (?, ?, ?, ?, ?, 'confirmed', ?, ?)
-    """, (
-        order_id,
-        order_data.get("customer_phone", "unknown"),
-        order_data.get("language", "en-IN"),
-        json.dumps(order_data.get("items", [])),
-        order_data.get("address", ""),
-        order_data.get("raw_transcript", ""),
-        datetime.utcnow().isoformat()
-    ))
-    conn.commit()
-    conn.close()
+    db = _get_db()
+    db.collection("orders").document(order_id).set({
+        "id": order_id,
+        "customer_phone": order_data.get("customer_phone", "unknown"),
+        "language": order_data.get("language", "en-IN"),
+        "items": order_data.get("items", []),
+        "address": order_data.get("address", ""),
+        "status": "confirmed",
+        "raw_transcript": order_data.get("raw_transcript", ""),
+        "confirmed_at": datetime.utcnow().isoformat()
+    })
 
 def get_orders(limit=50):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM orders ORDER BY confirmed_at DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        d = dict(r)
-        d["items"] = json.loads(d["items"]) if d["items"] else []
-        result.append(d)
-    return result
+    db = _get_db()
+    docs = db.collection("orders").order_by(
+        "confirmed_at", direction=firestore.Query.DESCENDING
+    ).limit(limit).stream()
+    return [doc.to_dict() for doc in docs]
