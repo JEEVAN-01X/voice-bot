@@ -8,3 +8,4 @@ node_modules/
 *.log
 firebase-creds.json
 voice-bot/
+backend/orders.db
