@@ -1,107 +1,155 @@
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
-from ai_engine import process_order, detect_intent, increment_retries, can_retry, confirm_order
+from ai_engine import process_order, detect_intent, increment_retries, can_retry, confirm_order, pending_orders
 from db import save_order
 
 router = APIRouter()
 
-LANG_CONFIG = {
-    'en-IN': {'order_prompt': 'Please tell me your order.', 'not_heard': 'Sorry, I did not catch that. Please try again.', 'thank_you': 'Thank you! Your order has been confirmed. Goodbye!', 'retry': 'No problem. Please tell me your order again.'},
-    'hi-IN': {'order_prompt': 'Apna order batayein.', 'not_heard': 'Maafi kijiye, mujhe suna nahi. Dobara bolein.', 'thank_you': 'Shukriya! Aapka order confirm ho gaya. Namaste!', 'retry': 'Koi baat nahi. Apna order dobara batayein.'},
-    'kn-IN': {'order_prompt': 'Nimma order heliri.', 'not_heard': 'Kshamisi, nange keLisalilla. Dayavittu maddu helirii.', 'thank_you': 'Dhanyavadagalu! Nimma order drudheegondide.', 'retry': 'Parvaagilla. Nimma order maddu helirii.'},
-    'mr-IN': {'order_prompt': 'Aapla order sanga.', 'not_heard': 'Maafi kara, mala aaikale nahi. Punha sanga.', 'thank_you': 'Dhanyavad! Aapla order confirm zhala.', 'retry': 'Thik aahe. Aapla order punha sanga.'},
+THANK_YOU = {
+    'en-IN': "Wonderful! Your order is confirmed. We'll get that to you soon. Have a great day!",
+    'hi-IN': "Bahut acha! Aapka order confirm ho gaya. Jaldi pahunchenge. Dhanyavaad!",
+    'kn-IN': "Thumba chennaagide! Nimma order confirm aagide. Sheegrane kalisutteve. Dhanyavaadagalu!",
+    'mr-IN': "Chhan! Aapla order confirm zhala. Lavkar pathavto. Dhanyavaad!",
+}
+
+RETRY_PROMPT = {
+    'en-IN': "No problem at all! What would you like to change?",
+    'hi-IN': "Koi baat nahi! Kya badalna chahte hain?",
+    'kn-IN': "Parvaagilla! Enu badalaayisabeku?",
+    'mr-IN': "Thik aahe! Kay badlayacha aahe?",
+}
+
+MAX_RETRIES_MSG = {
+    'en-IN': "I'm sorry, I'm having trouble understanding. Please call us back and we'll help you. Goodbye!",
+    'hi-IN': "Maafi kijiye, samajhne mein dikkat ho rahi hai. Dobara call karein. Namaste!",
+    'kn-IN': "Kshamisi, arthamaadikollalu kashta aagutide. Dayavittu maddu call madi. Vandanegalu!",
+    'mr-IN': "Maafi kara, samajhayala tras hot aahe. Punha call kara. Namaskar!",
 }
 
 @router.post('/call-start')
 async def call_start():
     resp = VoiceResponse()
-    gather = Gather(num_digits=1, action='/twilio/language-selected')
-    gather.say('Press 1 for English. 2 ke liye Hindi. 3 for Kannada. 4 for Marathi.')
+    gather = Gather(
+        input='speech',
+        action='/twilio/process-speech',
+        language='en-IN',          # Twilio STT hint — handles all 4 languages fine
+        speech_timeout="auto",
+        timeout=40,
+        enhanced='false',
+        profanity_filter='false',
+    )
+    # Priya introduces herself — warm, human, no menu
+    gather.say(
+        "Hi! This is Priya from Automaton AI. Please tell me your order.",
+        language='en-IN',
+        voice='Polly.Aditi',       # Indian English voice — sounds human
+    )
     resp.append(gather)
+    resp.redirect('/twilio/call-start')  # if nobody speaks, try again
     return Response(content=str(resp), media_type='application/xml')
 
-@router.post('/language-selected')
-async def language_selected(Digits: str = Form(...)):
-    lang_map = {'1': 'en-IN', '2': 'hi-IN', '3': 'kn-IN', '4': 'mr-IN'}
-    lang = lang_map.get(Digits, 'en-IN')
-    cfg = LANG_CONFIG[lang]
-    resp = VoiceResponse()
-    gather = Gather(input='speech', action=f'/twilio/process-speech?lang={lang}',
-                    language=lang, speech_timeout=3)
-    gather.say(cfg['order_prompt'])
-    resp.append(gather)
-    return Response(content=str(resp), media_type='application/xml')
 
 @router.post('/process-speech')
-async def process_speech(request: Request, lang: str = 'en-IN', SpeechResult: str = Form(default='')):
-    cfg = LANG_CONFIG[lang]
+async def process_speech(
+    request: Request,
+    lang: str = 'auto',
+    SpeechResult: str = Form(default=''),
+):
     resp = VoiceResponse()
 
-    if not SpeechResult:
-        resp.say(cfg['not_heard'], language=lang)
-        resp.redirect('/twilio/language-selected')
+    if not SpeechResult.strip():
+        gather = Gather(
+            input='speech',
+            action='/twilio/process-speech',
+            language='en-IN',
+            speech_timeout="auto",
+            timeout=40,
+            enhanced='false',
+        )
+        gather.say("Sorry, I didn't catch that. Please tell me your order.", language='en-IN', voice='Polly.Aditi')
+        resp.append(gather)
         return Response(content=str(resp), media_type='application/xml')
 
-    # ✅ NOW calling ai_engine
+    print(f'[STT] {SpeechResult}')
+    print(f'[DEBUG] SpeechResult: {SpeechResult}')
     result = await process_order(SpeechResult, lang)
+    print(f'[DEBUG] AI result: {result}')
+    print(f'[AI] {result}')
 
-    if not result['id'] or not result['items']:
-        # AI couldn't extract anything meaningful
-        resp.say(cfg['not_heard'], language=lang)
-        resp.redirect(f'/twilio/language-selected')
-        return Response(content=str(resp), media_type='application/xml')
+    # Use language detected by AI
+    detected_lang = result.get('language', 'en-IN')
+
+    # Store caller phone
+    form = await request.form()
+    caller = form.get('Caller', 'unknown')
+    if result['id'] in pending_orders:
+        pending_orders[result['id']]['customer_phone'] = caller
+        pending_orders[result['id']]['raw_transcript'] = SpeechResult
 
     gather = Gather(
         input='speech',
-        action=f'/twilio/confirm?lang={lang}&order_id={result["id"]}',
-        language=lang,
-        speech_timeout=3
+        action=f'/twilio/confirm?lang={detected_lang}&order_id={result["id"]}',
+        language=detected_lang,
+        speech_timeout="auto",
+        timeout=40,
+        enhanced='false',
     )
-    gather.say(result['confirm_message'], language=lang)
+    gather.say(result['confirm_message'], language=detected_lang)
     resp.append(gather)
     return Response(content=str(resp), media_type='application/xml')
 
-@router.post('/confirm')
-async def confirm(lang: str = 'en-IN', order_id: str = '', SpeechResult: str = Form(default='')):
-    cfg = LANG_CONFIG[lang]
-    resp = VoiceResponse()
 
+@router.post('/confirm')
+async def confirm(
+    lang: str = 'en-IN',
+    order_id: str = '',
+    SpeechResult: str = Form(default=''),
+):
+    resp = VoiceResponse()
     intent = detect_intent(SpeechResult)
 
     if intent == 'confirm':
-        # Save to Firebase
         order_data = confirm_order(order_id)
-        await save_order(order_id, order_data)
-        resp.say(cfg['thank_you'], language=lang)
+        try:
+            save_order(order_id, order_data)
+            print(f'[DB] ✅ Saved order {order_id}: {order_data.get("items")}')
+        except Exception as e:
+            print(f'[DB ERROR] {e}')
+        resp.say(THANK_YOU.get(lang, THANK_YOU['en-IN']), language=lang)
         resp.hangup()
 
-    elif intent == 'deny' or intent == 'unclear':
+    elif intent == 'deny':
         increment_retries(order_id)
         if can_retry(order_id):
-            # Retry with context — pass order_id so ai_engine remembers
-            result = await process_order(SpeechResult, lang, order_id=order_id)
+            resp.say(RETRY_PROMPT.get(lang, RETRY_PROMPT['en-IN']), language=lang)
             gather = Gather(
                 input='speech',
-                action=f'/twilio/confirm?lang={lang}&order_id={result["id"]}',
+                action=f'/twilio/process-speech?lang={lang}',
                 language=lang,
-                speech_timeout=3
+                speech_timeout="auto",
+                timeout=40,
+                enhanced='false',
             )
-            gather.say(result['confirm_message'], language=lang)
             resp.append(gather)
         else:
-            # Max retries hit — graceful exit
-            endings = {
-                'en-IN': 'Sorry, we could not process your order. Please call again. Goodbye!',
-                'hi-IN': 'Maafi kijiye, aapka order process nahi ho saka. Dobara call karein. Namaste!',
-                'kn-IN': 'Kshamisi, nimma order process aagalilla. Dayavittu maddu call madi.',
-                'mr-IN': 'Maafi kara, aapla order process zhaala nahi. Punha call kara.',
-            }
-            resp.say(endings.get(lang, endings['en-IN']), language=lang)
+            resp.say(MAX_RETRIES_MSG.get(lang, MAX_RETRIES_MSG['en-IN']), language=lang)
             resp.hangup()
 
     else:
-        resp.say(cfg['not_heard'], language=lang)
-        resp.redirect(f'/twilio/language-selected')
+        # Unclear — ask again gently
+        gather = Gather(
+            input='speech',
+            action=f'/twilio/confirm?lang={lang}&order_id={order_id}',
+            language=lang,
+            speech_timeout="auto",
+            timeout=40,
+            enhanced='false',
+        )
+        gather.say(
+            "Sorry, just say yes to confirm or no to change something.",
+            language=lang,
+        )
+        resp.append(gather)
 
     return Response(content=str(resp), media_type='application/xml')
